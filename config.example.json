@@ -3,11 +3,14 @@
   "canvas_token": "PASTE_CANVAS_TOKEN_HERE",
   "canvas_ics_url": "",
 
+  "gradescope_email": "",
+  "gradescope_password": "",
+
   "microsoft_client_id": "PASTE_APPLICATION_CLIENT_ID_HERE",
 
-  "list_mode": "single",
   "list_name": "Canvas",
-  "course_aliases": {},
+  "list_mode": "single",
+  "courses": {},
   "skip_courses": [],
 
   "timezone": "America/Los_Angeles",
