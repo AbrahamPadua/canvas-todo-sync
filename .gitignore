@@ -1,0 +1,42 @@
+# Local Python environments and caches
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local configuration and authentication data
+config.json
+ms_token_cache.json
+
+# Runtime state and logs
+sync_state.json
+sync.log
+launchd_errors.log
+*.log
+
+# Local archives and generated distribution files
+*.zip
+*.tar
+*.tar.gz
+*.7z
+build/
+dist/
+*.egg-info/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
