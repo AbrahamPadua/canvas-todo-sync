@@ -1,0 +1,24 @@
+{
+  "canvas_base_url": "https://canvas.ucsd.edu",
+  "canvas_token": "PASTE_CANVAS_TOKEN_HERE",
+  "canvas_ics_url": "",
+
+  "gradescope_email": "",
+  "gradescope_password": "",
+
+  "microsoft_client_id": "PASTE_APPLICATION_CLIENT_ID_HERE",
+
+  "list_name": "Canvas",
+  "list_mode": "single",
+  "courses": {},
+  "skip_courses": [],
+
+  "timezone": "America/Los_Angeles",
+  "lookback_days": 3,
+  "lookahead_days": 120,
+  "reminder_hours_before": 24,
+  "sync_every_hours": 2,
+
+  "include_types": ["assignment", "quiz", "discussion_topic", "sub_assignment",
+                    "assessment_request", "wiki_page", "planner_note"]
+}
