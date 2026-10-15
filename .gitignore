@@ -13,6 +13,7 @@ ms_token_cache.json
 
 # Runtime state and logs
 sync_state.json
+due_cache.json
 sync.log
 launchd_errors.log
 *.log

@@ -1216,6 +1216,13 @@ def main() -> int:
         counts = sync(cfg, graph, items, state, now)
         state["last_sync"] = now.isoformat()
         save_state(state)
+        # Offline snapshot of upcoming work so other tools (like a morning brief) can read it
+        # without reaching Canvas or Gradescope. Holds no credentials.
+        try:
+            write_private(HERE / "due_cache.json",
+                          json.dumps(preview_json(items, source, matches, cfg, now), indent=1))
+        except OSError as e:
+            log.warning(f"Could not write due_cache.json: {e}")
         summary = ", ".join(f"{n} {k}" for k, n in counts.items() if n) or "nothing to do"
         log.info(f"Sync finished ({source}, {len(items)} items, {len(matches)} matched across both): {summary}")
         return 0
