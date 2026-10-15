@@ -9,13 +9,16 @@ becomes a single task. Each course can go to its own To Do list.
 
 Commands
   python3 canvas_todo_sync.py --preview             list what would sync (no Microsoft needed)
+  python3 canvas_todo_sync.py --preview --json      the same, as JSON (for scripts and AI agents)
+  python3 canvas_todo_sync.py --status              last sync, schedule, recent log lines
   python3 canvas_todo_sync.py --login               one-time Microsoft sign-in
   python3 canvas_todo_sync.py --lists               show your To Do lists and where each course goes
   python3 canvas_todo_sync.py                       sync once
   python3 canvas_todo_sync.py --install-schedule    sync automatically every few hours
   python3 canvas_todo_sync.py --uninstall-schedule  stop the automatic sync
 
-Settings live in config.json next to this file (copy config.example.json).
+Settings and state live in the data folder: $CANVAS_TODO_HOME if set, else this
+script's folder if it holds config.json, else ~/canvas-todo-sync.
 """
 from __future__ import annotations
 
@@ -40,7 +43,22 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-HERE = Path(__file__).resolve().parent
+__version__ = "2.1.0"
+
+
+def _data_dir() -> Path:
+    """Where config, sign-in and state live, so any copy of this script (e.g. one bundled in a
+    skill folder) finds the same data."""
+    env = os.environ.get("CANVAS_TODO_HOME")
+    if env:
+        return Path(env).expanduser()
+    script_dir = Path(__file__).resolve().parent
+    if (script_dir / "config.json").exists():
+        return script_dir
+    return Path.home() / "canvas-todo-sync"
+
+
+HERE = _data_dir()
 CONFIG_PATH = HERE / "config.json"
 STATE_PATH = HERE / "sync_state.json"
 TOKEN_CACHE_PATH = HERE / "ms_token_cache.json"
@@ -92,14 +110,16 @@ log = logging.getLogger("canvas_todo_sync")
 
 # --------------------------------------------------------------------------- setup
 
-def setup_logging() -> None:
+def setup_logging(console=None) -> None:
     log.setLevel(logging.INFO)
     log.handlers.clear()
-    fh = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=500_000, backupCount=1, encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    log.addHandler(fh)
-    if sys.stdout is not None:  # pythonw on Windows has no stdout
-        sh = logging.StreamHandler(sys.stdout)
+    if HERE.is_dir():
+        fh = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=500_000, backupCount=1, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(fh)
+    console = console or sys.stdout
+    if console is not None:  # pythonw on Windows has no stdout
+        sh = logging.StreamHandler(console)
         sh.setFormatter(logging.Formatter("%(message)s"))
         log.addHandler(sh)
 
@@ -110,7 +130,8 @@ def is_set(value) -> bool:
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
-        sys.exit(f"Missing {CONFIG_PATH.name}. Copy config.example.json to config.json and fill it in.")
+        sys.exit(f"Missing {CONFIG_PATH}. Copy config.example.json to config.json and fill it in "
+                 f"(or set CANVAS_TODO_HOME to the folder that has it).")
     cfg = dict(DEFAULTS)
     cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
     cfg["canvas_token"] = os.environ.get("CANVAS_TOKEN") or cfg.get("canvas_token", "")
@@ -168,7 +189,7 @@ class Item:
 TERM_WORDS = {"FA", "WI", "SP", "SU", "SS", "FALL", "WIN", "WINTER", "SPR", "SPRING", "SUM", "SUMMER"}
 CODE_RE = re.compile(r"\b([A-Z]{2,5})[\s\-]*(\d{1,3}[A-Z]{0,2})\b")
 SEEN_COURSES = defaultdict(lambda: {"Canvas": set(), "Gradescope": set()})  # canonical -> raw names
-RUN_INFO = {"gradescope_failed": False}
+RUN_INFO = {"gradescope_failed": False, "warnings": []}
 
 
 def course_code(raw: str) -> str:
@@ -467,7 +488,7 @@ def gradescope_login(cfg: dict) -> requests.Session:
     })
     if not r.history or "/login" in r.url:
         raise SyncError("Gradescope login failed. Check gradescope_email and gradescope_password "
-                        "(README: 'Gradescope'). If you only ever used UCSD single sign-on, set a password first.")
+                        "(setup guide, Gradescope section). If you only ever used UCSD single sign-on, set a password first.")
     return s
 
 
@@ -578,6 +599,7 @@ def fetch_items(cfg: dict, now: datetime) -> tuple:
         raise SyncError('config.json needs either "canvas_token" or "canvas_ics_url".')
     gradescope = []
     RUN_INFO["gradescope_failed"] = False
+    RUN_INFO["warnings"] = []
     if gradescope_enabled(cfg):
         try:
             gradescope = fetch_from_gradescope(cfg, now)
@@ -585,6 +607,7 @@ def fetch_items(cfg: dict, now: datetime) -> tuple:
         except (SyncError, requests.RequestException) as e:
             # Canvas still syncs; Gradescope-only tasks simply don't update this run.
             RUN_INFO["gradescope_failed"] = True
+            RUN_INFO["warnings"].append(f"Gradescope skipped: {e}")
             log.error(f"Gradescope skipped this run: {e}")
             _notify(f"Gradescope skipped: {str(e)[:90]}")
     items, matches = merge_sources(canvas, gradescope)
@@ -597,7 +620,7 @@ def ms_token(cfg: dict, interactive: bool) -> str:
     import msal  # imported here so --preview works before Microsoft is set up
 
     if not is_set(cfg["microsoft_client_id"]):
-        raise SyncError('config.json is missing "microsoft_client_id" (see README, step 4).')
+        raise SyncError('config.json is missing "microsoft_client_id" (setup guide: Microsoft app registration).')
     cache = msal.SerializableTokenCache()
     if TOKEN_CACHE_PATH.exists():
         cache.deserialize(TOKEN_CACHE_PATH.read_text(encoding="utf-8"))
@@ -1060,17 +1083,109 @@ def print_lists(cfg: dict, graph: Graph) -> None:
     print()
 
 
+def preview_json(items: list, source: str, matches: list, cfg: dict, now: datetime) -> dict:
+    tz = ZoneInfo(cfg["timezone"])
+    rows = []
+    for i in sorted(items, key=lambda i: i.due or datetime.max.replace(tzinfo=timezone.utc)):
+        rows.append({
+            "course": i.course, "title": i.title, "kind": i.kind,
+            "source": "Canvas+Gradescope" if i.alt_keys else i.source,
+            "due": i.due.astimezone(tz).isoformat() if i.due else None,
+            "due_local": fmt_local(i.due, tz) if i.due else None,
+            "todo_due_date": due_date_key(i, tz),
+            "complete": i.complete, "url": i.url,
+            "links": [{"label": l, "url": u} for l, u in i.extra_links],
+            "todo_list": target_list(i, cfg)[0],
+        })
+    courses = []
+    for name in sorted(SEEN_COURSES):
+        seen = SEEN_COURSES[name]
+        spec = course_spec(cfg, name)
+        courses.append({"name": name, "canvas_names": sorted(seen["Canvas"]),
+                        "gradescope_names": sorted(seen["Gradescope"]),
+                        "todo_list": target_list(Item("", "", "", name, None, "", None, False), cfg)[0],
+                        "configured": bool(spec)})
+    return {
+        "generated_at": now.astimezone(tz).isoformat(), "timezone": cfg["timezone"], "source": source,
+        "warnings": list(RUN_INFO.get("warnings") or []),
+        "matched_across_sites": [{"course": c.course, "canvas": c.title, "gradescope": g.title} for g, c in matches],
+        "items": rows, "courses": courses,
+    }
+
+
+def schedule_status() -> str:
+    try:
+        return _schedule_status()
+    except (FileNotFoundError, OSError) as e:
+        return f"unknown ({e})"
+
+
+def _schedule_status() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        plist = Path.home() / "Library" / "LaunchAgents" / f"local.{SCHEDULE_LABEL}.plist"
+        if not plist.exists():
+            return "not installed"
+        r = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/local.{SCHEDULE_LABEL}"],
+                           capture_output=True, text=True)
+        return "installed and loaded" if r.returncode == 0 else "installed but not loaded (rerun --install-schedule)"
+    if system == "Windows":
+        r = subprocess.run(["schtasks", "/Query", "/TN", "CanvasTodoSync"], capture_output=True, text=True)
+        return "installed" if r.returncode == 0 else "not installed"
+    r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    return "installed" if r.returncode == 0 and SCHEDULE_LABEL in r.stdout else "not installed"
+
+
+def print_status() -> None:
+    print(f"canvas_todo_sync {__version__}")
+    print(f"Data folder: {HERE}")
+    if not CONFIG_PATH.exists():
+        print("Config: missing (not set up yet; see the setup guide)")
+        return
+    cfg = load_config()
+    canvas = "API token" if is_set(cfg["canvas_token"]) else ("calendar feed" if is_set(cfg["canvas_ics_url"]) else "NOT SET")
+    print(f"Canvas: {canvas}")
+    print(f"Gradescope: {'on (' + cfg['gradescope_email'] + ')' if gradescope_enabled(cfg) else 'off'}")
+    print(f"Microsoft app: {'set' if is_set(cfg['microsoft_client_id']) else 'NOT SET'}; "
+          f"signed in: {'yes' if TOKEN_CACHE_PATH.exists() else 'no (run --login)'}")
+    routed = {k: v.get("todo_list") for k, v in cfg["courses"].items() if v.get("todo_list")}
+    print(f"Routing: {len(routed)} course(s) to their own lists; others to '{cfg['list_name']}'")
+    state = load_state() if STATE_PATH.exists() else {}
+    last = state.get("last_sync")
+    if last:
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(last)
+        hours = age.total_seconds() / 3600
+        print(f"Last successful sync: {last} ({hours:.1f} hours ago)")
+    else:
+        print("Last successful sync: never")
+    print(f"Tracked tasks: {sum(1 for e in state.get('items', {}).values() if e.get('task_id'))}")
+    print(f"Automatic sync: {schedule_status()}")
+    if LOG_PATH.exists():
+        lines = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-12:]
+        print("\nRecent log:")
+        for line in lines:
+            print("  " + line)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Sync Canvas and Gradescope assignments into Microsoft To Do.")
+    ap.add_argument("--version", action="version", version=f"canvas_todo_sync {__version__}")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--preview", action="store_true", help="list what would sync without touching To Do")
+    g.add_argument("--status", action="store_true", help="show setup, last sync, schedule and recent log")
     g.add_argument("--login", action="store_true", help="sign in to Microsoft (one time)")
     g.add_argument("--lists", action="store_true", help="show your To Do lists and course routing")
     g.add_argument("--install-schedule", action="store_true", help="run the sync automatically")
     g.add_argument("--uninstall-schedule", action="store_true", help="stop the automatic sync")
+    ap.add_argument("--json", action="store_true", help="with --preview: print JSON only (logs go to stderr)")
     args = ap.parse_args()
-    setup_logging()
+    if args.json and not args.preview:
+        ap.error("--json only works with --preview")
+    setup_logging(console=sys.stderr if args.json else None)
 
+    if args.status:
+        print_status()
+        return 0
     if args.uninstall_schedule:
         uninstall_schedule()
         return 0
@@ -1091,7 +1206,10 @@ def main() -> int:
             return 0
         items, source, matches = fetch_items(cfg, now)
         if args.preview:
-            print_preview(items, source, matches, cfg)
+            if args.json:
+                print(json.dumps(preview_json(items, source, matches, cfg, now), indent=1))
+            else:
+                print_preview(items, source, matches, cfg)
             return 0
         graph = Graph(ms_token(cfg, interactive=interactive))
         state = load_state()
@@ -1103,6 +1221,8 @@ def main() -> int:
         return 0
     except (SyncError, requests.RequestException) as e:
         log.error(str(e))
+        if args.json:
+            print(json.dumps({"error": str(e)}))
         _notify(str(e)[:120])
         return 1
 
