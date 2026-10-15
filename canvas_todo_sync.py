@@ -11,6 +11,9 @@ Commands
   python3 canvas_todo_sync.py --preview             list what would sync (no Microsoft needed)
   python3 canvas_todo_sync.py --preview --json      the same, as JSON (for scripts and AI agents)
   python3 canvas_todo_sync.py --status              last sync, schedule, recent log lines
+  python3 canvas_todo_sync.py --announcements --json  recent Canvas announcements, new ones flagged
+  python3 canvas_todo_sync.py --add-task "TITLE" --course C [--due D] [--note N] [--link URL]
+  python3 canvas_todo_sync.py --update-task "MATCH" [--course C] [--due D] [--note N] [--done]
   python3 canvas_todo_sync.py --login               one-time Microsoft sign-in
   python3 canvas_todo_sync.py --lists               show your To Do lists and where each course goes
   python3 canvas_todo_sync.py                       sync once
@@ -24,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html as html_lib
 import json
 import logging
 import logging.handlers
@@ -43,7 +47,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 
 def _data_dir() -> Path:
@@ -63,11 +67,13 @@ CONFIG_PATH = HERE / "config.json"
 STATE_PATH = HERE / "sync_state.json"
 TOKEN_CACHE_PATH = HERE / "ms_token_cache.json"
 LOG_PATH = HERE / "sync.log"
+SEEN_PATH = HERE / "announcements_seen.json"
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 MS_AUTHORITY = "https://login.microsoftonline.com/common"
 MS_SCOPES = ["Tasks.ReadWrite"]
-OWNED_APPS = {"Canvas", "Gradescope"}   # linkedResource.applicationName values this script writes
+OWNED_APPS = {"Canvas", "Gradescope"}   # linkedResource.applicationName values the sync manages
+MANUAL_APP = "Canvas announcement"     # tasks added by --add-task; the sync never touches these
 SCHEDULE_LABEL = "canvas-todo-sync"
 USER_AGENT = "Mozilla/5.0 (compatible; canvas_todo_sync)"
 
@@ -967,6 +973,215 @@ def sync(cfg: dict, graph: Graph, items: list, state: dict, now: datetime) -> Co
     return counts
 
 
+# --------------------------------------------------------------------------- announcements
+
+def html_to_text(html: str) -> str:
+    t = re.sub(r"(?is)<(script|style).*?</\1>", " ", html or "")
+    t = re.sub(r"(?i)<br\s*/?>|</(p|div|li|h[1-6]|tr)>", "\n", t)
+    t = re.sub(r"(?i)<li[^>]*>", "- ", t)
+    t = html_lib.unescape(re.sub(r"<[^>]+>", " ", t)).replace("\xa0", " ")
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in t.splitlines()]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def load_seen() -> dict:
+    try:
+        return json.loads(SEEN_PATH.read_text(encoding="utf-8")).get("seen", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def fetch_announcements(cfg: dict, now: datetime, days: int) -> list:
+    if not is_set(cfg["canvas_token"]):
+        raise SyncError("Reading announcements needs a Canvas access token (the calendar feed doesn't include them).")
+    base, tz = cfg["canvas_base_url"], ZoneInfo(cfg["timezone"])
+    s = requests.Session()
+    s.headers["Authorization"] = f"Bearer {cfg['canvas_token']}"
+    courses = canvas_get_all(s, f"{base}/api/v1/courses", {"enrollment_state": "active", "per_page": 100})
+    names, codes = {}, []
+    for c in courses:
+        if not isinstance(c, dict) or "id" not in c:
+            continue
+        raw = c.get("course_code") or c.get("name") or ""
+        course = resolve_course(raw, "Canvas", cfg) if raw else ""
+        if is_skipped(cfg, course, raw, c["id"]):
+            continue
+        names[f"course_{c['id']}"] = course or raw
+        codes.append(f"course_{c['id']}")
+    if not codes:
+        return []
+    params = [("context_codes[]", code) for code in codes] + [
+        ("start_date", (now - timedelta(days=days)).date().isoformat()),
+        ("end_date", (now + timedelta(days=1)).date().isoformat()),
+        ("per_page", "100"),
+    ]
+    raw = canvas_get_all(s, f"{base}/api/v1/announcements", params)
+
+    seen = load_seen()
+    out = []
+    for a in raw:
+        if not isinstance(a, dict) or a.get("id") is None:
+            continue
+        posted = parse_iso(a.get("posted_at") or a.get("delayed_post_at") or a.get("created_at"))
+        aid = str(a["id"])
+        text = html_to_text(a.get("message") or "")
+        url = a.get("html_url") or ""
+        if url.startswith("/"):
+            url = base + url
+        out.append({
+            "id": aid, "course": names.get(a.get("context_code"), a.get("context_code") or ""),
+            "title": (a.get("title") or "").strip(),
+            "posted": posted.astimezone(tz).isoformat() if posted else None,
+            "posted_local": fmt_local(posted, tz) if posted else None,
+            "author": (a.get("author") or {}).get("display_name") or a.get("user_name") or "",
+            "new": aid not in seen,
+            "text": text[:4000] + (" [...]" if len(text) > 4000 else ""),
+            "url": url,
+        })
+    out.sort(key=lambda x: x["posted"] or "", reverse=True)
+
+    # Remember what has been reported, so the next check can say what's new.
+    stamp = now.isoformat()
+    for a in out:
+        seen.setdefault(a["id"], stamp)
+    cutoff = (now - timedelta(days=200)).isoformat()
+    seen = {k: v for k, v in seen.items() if v >= cutoff}
+    write_private(SEEN_PATH, json.dumps({"seen": seen}, indent=1, sort_keys=True))
+    return out
+
+
+def print_announcements(rows: list, days: int) -> None:
+    new = sum(1 for a in rows if a["new"])
+    print(f"\n{len(rows)} announcement(s) in the last {days} days, {new} new:\n")
+    for a in rows:
+        flag = "NEW " if a["new"] else "    "
+        print(f"{flag}{a['posted_local'] or '?':<22} {a['course'][:12]:<12} {a['title']}")
+        snippet = a["text"].replace("\n", " ")
+        if snippet:
+            print(f"      {snippet[:240]}{'...' if len(snippet) > 240 else ''}")
+        print(f"      {a['url']}")
+
+
+# --------------------------------------------------------------------------- manual task edits
+
+def parse_due_arg(value: str, tz: ZoneInfo) -> datetime:
+    value = (value or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return datetime.fromisoformat(value).replace(hour=23, minute=59, tzinfo=tz)
+    dt = parse_loose_dt(value, tz)
+    if dt is None:
+        raise SyncError(f'Couldn\'t read the date "{value}". Use YYYY-MM-DD or "YYYY-MM-DD HH:MM" (local time).')
+    return dt
+
+
+def canonical_course(cfg: dict, course: str) -> str:
+    if not course:
+        return ""
+    if course in cfg["courses"]:
+        return course
+    code = course_code(course)
+    return next((k for k in cfg["courses"] if course_code(k) == code), code or course)
+
+
+def routed_list_names(cfg: dict) -> list:
+    names = [cfg["list_name"]] + [spec.get("todo_list") for spec in cfg["courses"].values()]
+    return list(dict.fromkeys(n for n in names if n))
+
+
+def add_task(cfg: dict, graph: Graph, title: str, course: str, due: Optional[datetime], note: str,
+             link: str, now: datetime) -> dict:
+    tz = ZoneInfo(cfg["timezone"])
+    graph_tz = WINDOWS_TZ.get(cfg["timezone"], cfg["timezone"])
+    course = canonical_course(cfg, course)
+    key = "manual:" + hashlib.sha1(f"{course}|{title.strip().casefold()}".encode()).hexdigest()[:12]
+    item = Item(key=key, kind="from an announcement", title=title.strip(), course=course, due=due,
+                url=link or cfg["canvas_base_url"] + "/", points=None, complete=False, source=MANUAL_APP)
+    name, _ = target_list(item, cfg)
+    resolver = ListResolver(graph)
+    lid = resolver.resolve(name, create_ok=not course_spec(cfg, course).get("todo_list"))
+    if not lid:
+        raise SyncError(resolver.problems.get(name, f'Couldn\'t find the To Do list "{name}".'))
+    title_out = task_title(item, cfg)
+    for t in graph.tasks(lid):
+        same_key = any(lr.get("externalId") == key for lr in t.get("linkedResources") or [])
+        if same_key or t.get("title", "").strip().casefold() == title_out.casefold():
+            return {"action": "exists", "title": t.get("title"), "list": name}
+    lines = []
+    if course:
+        lines.append(f"Course: {course}")
+    if due:
+        lines.append(f"Due: {fmt_local(due, tz)}")
+    if note:
+        lines += ["", note.strip()]
+    if link:
+        lines += ["", f"Source: {link}"]
+    lines += ["", "Added by canvas_todo_sync from a Canvas announcement. The scheduled sync never changes this task."]
+    payload = {
+        "title": title_out,
+        "body": {"contentType": "text", "content": "\n".join(lines)},
+        "linkedResources": [{"webUrl": item.url, "applicationName": MANUAL_APP,
+                             "displayName": "Open source", "externalId": key}],
+    }
+    payload.update({k: v for k, v in due_fields(item, cfg, tz, graph_tz, now).items() if v is not None})
+    graph.create_task(lid, payload)
+    log.info(f"Added from announcement: {title_out}" + (f" (due {due_date_key(item, tz)})" if due else "") + f" -> {name}")
+    return {"action": "added", "title": title_out, "list": name, "due": due_date_key(item, tz)}
+
+
+def update_task(cfg: dict, graph: Graph, match: str, course: str, due: Optional[datetime], note: str,
+                done: bool, now: datetime) -> dict:
+    tz = ZoneInfo(cfg["timezone"])
+    graph_tz = WINDOWS_TZ.get(cfg["timezone"], cfg["timezone"])
+    course = canonical_course(cfg, course)
+    resolver = ListResolver(graph)
+    names = routed_list_names(cfg)
+    if course:
+        own = course_spec(cfg, course).get("todo_list")
+        names = [n for n in names if n in (own, cfg["list_name"])] or names
+    needle = match.strip().casefold()
+    found = []
+    for name in names:
+        for lid in resolver.find(name):
+            for t in graph.tasks(lid):
+                title = t.get("title", "")
+                if needle not in title.casefold():
+                    continue
+                if course and name == cfg["list_name"] and not title.casefold().startswith(course.casefold() + ":"):
+                    continue
+                found.append((name, lid, t))
+    if len(found) > 1:
+        open_ones = [f for f in found if f[2].get("status") != "completed"]
+        if len(open_ones) == 1:
+            found = open_ones
+    if not found:
+        raise SyncError(f'No To Do task matches "{match}"' + (f" in {course}" if course else "") + ".")
+    if len(found) > 1:
+        listing = "; ".join(f'"{t.get("title")}" ({n})' for n, _, t in found[:8])
+        raise SyncError(f'{len(found)} tasks match "{match}": {listing}. Be more specific or add --course.')
+
+    name, lid, task = found[0]
+    patch, changes = {}, []
+    if due:
+        probe = Item("", "", task.get("title", ""), course, due, "", None, False)
+        patch.update(due_fields(probe, cfg, tz, graph_tz, now))
+        changes.append(f"due -> {due_date_key(probe, tz)}")
+    if note:
+        old = (task.get("body") or {}).get("content", "") or ""
+        stamp = now.astimezone(tz).strftime("%b %d")
+        patch["body"] = {"contentType": "text", "content": (old.rstrip() + "\n\n" if old.strip() else "")
+                         + f"Update {stamp}: {note.strip()}"}
+        changes.append("note added")
+    if done:
+        patch["status"] = "completed"
+        changes.append("checked off")
+    if not patch:
+        raise SyncError("Nothing to change: give --due, --note and/or --done.")
+    if not graph.update_task(lid, task["id"], patch):
+        raise SyncError(f'"{task.get("title")}" disappeared from To Do while updating it.')
+    log.info(f"Updated by hand: {task.get('title')} ({', '.join(changes)})")
+    return {"action": "updated", "title": task.get("title"), "list": name, "changes": changes}
+
+
 # --------------------------------------------------------------------------- scheduling
 
 def _notify(message: str) -> None:
@@ -1177,10 +1392,26 @@ def main() -> int:
     g.add_argument("--lists", action="store_true", help="show your To Do lists and course routing")
     g.add_argument("--install-schedule", action="store_true", help="run the sync automatically")
     g.add_argument("--uninstall-schedule", action="store_true", help="stop the automatic sync")
-    ap.add_argument("--json", action="store_true", help="with --preview: print JSON only (logs go to stderr)")
+    g.add_argument("--announcements", action="store_true", help="list recent Canvas announcements (new ones flagged)")
+    g.add_argument("--add-task", metavar="TITLE", help="add a To Do task (e.g. a deadline from an announcement)")
+    g.add_argument("--update-task", metavar="MATCH", help="change the To Do task whose title contains MATCH")
+    ap.add_argument("--json", action="store_true", help="print JSON only (logs go to stderr)")
+    ap.add_argument("--days", type=int, default=14, help="with --announcements: how far back to look (default 14)")
+    ap.add_argument("--course", default="", help="with --add-task/--update-task: course, e.g. 'ECE 161A'")
+    ap.add_argument("--due", default="", help="with --add-task/--update-task: YYYY-MM-DD or 'YYYY-MM-DD HH:MM'")
+    ap.add_argument("--note", default="", help="with --add-task/--update-task: text for the task note")
+    ap.add_argument("--link", default="", help="with --add-task: link to the announcement")
+    ap.add_argument("--done", action="store_true", help="with --update-task: check the task off")
     args = ap.parse_args()
-    if args.json and not args.preview:
-        ap.error("--json only works with --preview")
+    edit = args.add_task is not None or args.update_task is not None
+    if args.json and not (args.preview or args.announcements or edit):
+        ap.error("--json works with --preview, --announcements, --add-task and --update-task")
+    if (args.course or args.due or args.note or args.link or args.done) and not edit:
+        ap.error("--course, --due, --note, --link and --done go with --add-task or --update-task")
+    if args.add_task is not None and not args.add_task.strip():
+        ap.error("--add-task needs a title")
+    if args.done and args.add_task is not None:
+        ap.error("--done goes with --update-task")
     setup_logging(console=sys.stderr if args.json else None)
 
     if args.status:
@@ -1203,6 +1434,25 @@ def main() -> int:
             return 0
         if args.lists:
             print_lists(cfg, Graph(ms_token(cfg, interactive=interactive)))
+            return 0
+        if args.announcements:
+            rows = fetch_announcements(cfg, now, max(1, args.days))
+            if args.json:
+                print(json.dumps({"generated_at": now.astimezone(ZoneInfo(cfg["timezone"])).isoformat(),
+                                  "days": args.days, "announcements": rows}, indent=1))
+            else:
+                print_announcements(rows, args.days)
+            return 0
+        if edit:
+            due = parse_due_arg(args.due, ZoneInfo(cfg["timezone"])) if args.due else None
+            graph = Graph(ms_token(cfg, interactive=interactive))
+            if args.add_task is not None:
+                result = add_task(cfg, graph, args.add_task, args.course, due, args.note, args.link, now)
+            else:
+                result = update_task(cfg, graph, args.update_task, args.course, due, args.note, args.done, now)
+            print(json.dumps(result) if args.json else
+                  f"{result['action'].capitalize()}: {result['title']} ({result['list']})"
+                  + (f" [{', '.join(result['changes'])}]" if result.get("changes") else ""))
             return 0
         items, source, matches = fetch_items(cfg, now)
         if args.preview:

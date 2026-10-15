@@ -41,3 +41,7 @@ htmlcov/
 .DS_Store
 Thumbs.db
 desktop.ini
+# Announcement state and local backup copies
+announcements_seen.json
+*.previous
+*.before-due-cache
